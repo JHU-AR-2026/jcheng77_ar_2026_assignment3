@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Q2e - WebXR AR (Babylon.js)</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #202028; }
+  #renderCanvas { width: 100%; height: 100%; touch-action: none; display: block; }
+  #info { position: absolute; top: 8px; left: 8px; color: #ddd; font: 13px sans-serif;
+          background: rgba(0,0,0,.5); padding: 6px 10px; border-radius: 6px; }
+</style>
+<script src="https://cdn.babylonjs.com/babylon.js"></script>
+<script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+</head>
+<body>
+<canvas id="renderCanvas"></canvas>
+<div id="info">Q2e: + A/B = scale up/down</div>
+<script>
+// ---------------- configuration ----------------
+const MODEL_URL   = "../";        // folder that contains the model
+const MODEL_FILE  = "car.glb";    // <-- your downloaded model
+const MODEL_SIZE  = 0.6;          // longest side of a freshly spawned model (metres)
+const MOVE_SPEED  = 0.75;         // metres / second at full thumbstick
+const ROT_SPEED   = Math.PI / 2;  // radians / second at full thumbstick
+const SCALE_STEP  = 1.1;          // A = x1.1, B = /1.1
+const DEADZONE    = 0.15;         // ignore tiny thumbstick drift
+
+// Which sub-parts are active in this file (Q2b always on)
+const ENABLE_MOVE   = true;   // Q2c
+const ENABLE_ROTATE = true; // Q2d
+const ENABLE_SCALE  = true;  // Q2e
+const ENABLE_RESET  = false;  // Q2f
+
+const canvas = document.getElementById("renderCanvas");
+const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+
+// ---------------- optional desktop emulator (testing only) ----------------
+// Open the page with ?emulate (e.g. http://localhost:8000/Q2f/?emulate) to emulate a
+// Meta Quest 3 in desktop Chrome using Meta's IWER runtime + DevUI overlay.
+// Without ?emulate the page uses the real headset's WebXR runtime unchanged.
+function loadScript(src) {
+    return new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = src; s.onload = resolve; s.onerror = () => reject(new Error("Failed to load " + src));
+        document.head.appendChild(s);
+    });
+}
+async function maybeInstallEmulator() {
+    if (!new URLSearchParams(location.search).has("emulate")) return;
+    await loadScript("https://cdn.jsdelivr.net/npm/iwer@2.5.0/build/iwer.min.js");
+    await loadScript("https://cdn.jsdelivr.net/npm/@iwer/devui@2.5.0/build/iwer-devui.min.js");
+    const xrDevice = new IWER.XRDevice(IWER.metaQuest3);
+    xrDevice.installRuntime({ forceInstall: true });   // replace desktop Chrome's (empty) native WebXR
+    new IWER_DevUI.DevUI(xrDevice);                      // on-screen controls for headset + controllers
+    window.xrDevice = xrDevice;                          // lets you drive the emulator from the console
+}
+
+const createScene = async function () {
+    await maybeInstallEmulator();
+    const scene = new BABYLON.Scene(engine);
+    scene.clearColor = new BABYLON.Color4(0, 0, 0, 0);   // transparent -> passthrough in AR
+
+    // Desktop camera (replaced by the XR camera inside the headset)
+    const camera = new BABYLON.FreeCamera("camera", new BABYLON.Vector3(0, 1.6, -2), scene);
+    camera.setTarget(new BABYLON.Vector3(0, 1, 0));
+    camera.attachControl(canvas, true);
+
+    const hemi = new BABYLON.HemisphericLight("hemi", new BABYLON.Vector3(0, 1, 0), scene);
+    hemi.intensity = 0.9;
+    const sun = new BABYLON.DirectionalLight("sun", new BABYLON.Vector3(-0.5, -1, 0.5), scene);
+    sun.intensity = 0.8;
+
+    // ---------- model template (loaded once, instanced on every spawn) ----------
+    const container = await BABYLON.SceneLoader.LoadAssetContainerAsync(MODEL_URL, MODEL_FILE, scene);
+
+    // ---------- reticle showing where the controller ray hits ----------
+    const reticle = BABYLON.MeshBuilder.CreateTorus("reticle", { diameter: 0.15, thickness: 0.01, tessellation: 32 }, scene);
+    const reticleMat = new BABYLON.StandardMaterial("reticleMat", scene);
+    reticleMat.emissiveColor = new BABYLON.Color3(0.2, 1, 0.4);
+    reticleMat.disableLighting = true;
+    reticle.material = reticleMat;
+    reticle.isPickable = false;
+    reticle.isVisible = false;
+
+    // ---------- WebXR (AR) ----------
+    const xr = await scene.createDefaultXRExperienceAsync({
+        uiOptions: {
+            sessionMode: "immersive-ar",
+            referenceSpaceType: "local-floor",
+            optionalFeatures: ["hit-test"]
+        },
+        disableTeleportation: true        // thumbsticks are used for our own controls
+    });
+    const sessionManager = xr.baseExperience.sessionManager;
+
+    // ---------- state ----------
+    const spawned = [];          // every spawned model (holder TransformNodes)
+    let lastModel = null;        // most recently spawned
+    let spawnCount = 0;
+    let rightController = null, leftController = null;
+    let rightHitSource = null;   // XRHitTestSource bound to the right controller's ray
+    let hitPoint = null;         // current hit position (Babylon world coords) or null
+    const ray = new BABYLON.Ray(BABYLON.Vector3.Zero(), BABYLON.Vector3.Forward(), 50);
+    const floorPlane = BABYLON.Plane.FromPositionAndNormal(BABYLON.Vector3.Zero(), BABYLON.Vector3.Up());
+
+    // ---------- spawning (Q2b) ----------
+    function spawnModel(position) {
+        const holder = new BABYLON.TransformNode("model" + (++spawnCount), scene);
+        const entries = container.instantiateModelsToScene((name) => holder.name + "_" + name, false);
+        const root = entries.rootNodes[0];
+        entries.rootNodes.forEach((n) => { n.parent = holder; });
+
+        // Normalise size and put the model's bottom-centre at the holder origin
+        holder.computeWorldMatrix(true);
+        let min = new BABYLON.Vector3( Infinity,  Infinity,  Infinity);
+        let max = new BABYLON.Vector3(-Infinity, -Infinity, -Infinity);
+        entries.rootNodes.forEach((r) => {
+            r.computeWorldMatrix(true);
+            r.getDescendants(false).forEach((d) => {
+                if (d.computeWorldMatrix) d.computeWorldMatrix(true);
+                if (d.getBoundingInfo && d.getTotalVertices && d.getTotalVertices() > 0) {
+                    d.refreshBoundingInfo();
+                    const bb = d.getBoundingInfo().boundingBox;
+                    min = BABYLON.Vector3.Minimize(min, bb.minimumWorld);
+                    max = BABYLON.Vector3.Maximize(max, bb.maximumWorld);
+                }
+            });
+        });
+        const size = max.subtract(min);
+        const longest = Math.max(size.x, size.y, size.z) || 1;
+        const offset = new BABYLON.Vector3((min.x + max.x) / 2, min.y, (min.z + max.z) / 2);
+        entries.rootNodes.forEach((r) => { r.position.subtractInPlace(offset); });
+        const s = MODEL_SIZE / longest;
+
+        // Place at hit point, facing the user
+        holder.position.copyFrom(position);
+        holder.scaling.setAll(s);
+        const cam = scene.activeCamera.globalPosition || scene.activeCamera.position;
+        holder.rotation.y = Math.atan2(cam.x - position.x, cam.z - position.z);
+
+        // Remember the spawn state for reset (Q2f)
+        holder.metadata = {
+            initialPosition: holder.position.clone(),
+            initialRotation: holder.rotation.clone(),
+            initialScaling:  holder.scaling.clone()
+        };
+        spawned.push(holder);
+        lastModel = holder;
+    }
+
+    // ---------- controller-ray hit test ----------
+    function toBabylon(pose) {
+        // WebXR is right-handed; Babylon's default scene is left-handed
+        const p = pose.transform.position;
+        const v = new BABYLON.Vector3(p.x, p.y, p.z);
+        if (!scene.useRightHandedSystem) v.z *= -1;
+        return v;
+    }
+
+    async function requestControllerHitTest(controller) {
+        const session = sessionManager.session;
+        if (!session || !session.requestHitTestSource) return;   // hit-test unsupported
+        try {
+            rightHitSource = await session.requestHitTestSource({ space: controller.inputSource.targetRaySpace });
+        } catch (e) {
+            console.warn("Controller hit-test source unavailable, using floor-plane fallback.", e);
+            rightHitSource = null;
+        }
+    }
+
+    sessionManager.onXRFrameObservable.add((frame) => {
+        hitPoint = null;
+        // 1) Real WebXR hit test along the right controller's ray
+        if (rightHitSource) {
+            const results = frame.getHitTestResults(rightHitSource);
+            if (results.length > 0) {
+                const pose = results[0].getPose(sessionManager.referenceSpace);
+                if (pose) hitPoint = toBabylon(pose);
+            }
+        }
+        // 2) Fallback: intersect the controller ray with the floor (y = 0)
+        if (!hitPoint && rightController) {
+            rightController.getWorldPointerRayToRef(ray);
+            const d = ray.intersectsPlane(floorPlane);
+            if (d !== null && d > 0) hitPoint = ray.origin.add(ray.direction.scale(d));
+        }
+        reticle.isVisible = !!hitPoint;
+        if (hitPoint) reticle.position.copyFrom(hitPoint);
+    });
+
+    sessionManager.onXRSessionEnded.add(() => {
+        if (rightHitSource) { rightHitSource.cancel(); rightHitSource = null; }
+        rightController = leftController = null;
+        reticle.isVisible = false;
+    });
+
+    // ---------- controller buttons ----------
+    function onPress(component, fn) {
+        if (!component) return;
+        component.onButtonStateChangedObservable.add((c) => {
+            if (c.changes.pressed && c.pressed) fn();     // fire once per press
+        });
+    }
+
+    xr.input.onControllerAddedObservable.add((controller) => {
+        const hand = controller.inputSource.handedness;
+        if (hand === "right") { rightController = controller; requestControllerHitTest(controller); }
+        if (hand === "left")  { leftController  = controller; }
+
+        controller.onMotionControllerInitObservable.add((mc) => {
+            if (hand === "right") {
+                // Q2b: right trigger spawns at the hit-test location
+                onPress(mc.getComponent("xr-standard-trigger"), () => { if (hitPoint) spawnModel(hitPoint); });
+                // Q2e: A = bigger, B = smaller (uniform)
+                if (ENABLE_SCALE) {
+                    onPress(mc.getComponent("a-button"), () => { if (lastModel) lastModel.scaling.scaleInPlace(SCALE_STEP); });
+                    onPress(mc.getComponent("b-button"), () => { if (lastModel) lastModel.scaling.scaleInPlace(1 / SCALE_STEP); });
+                }
+            }
+            if (hand === "left" && ENABLE_RESET) {
+                // Q2f: X restores the most recent model's spawn pose and scale
+                onPress(mc.getComponent("x-button"), () => {
+                    if (!lastModel) return;                       // nothing spawned yet -> no error
+                    const m = lastModel.metadata;
+                    lastModel.position.copyFrom(m.initialPosition);
+                    lastModel.rotation.copyFrom(m.initialRotation);
+                    lastModel.scaling.copyFrom(m.initialScaling);
+                });
+            }
+        });
+    });
+
+    xr.input.onControllerRemovedObservable.add((controller) => {
+        if (controller === rightController) {
+            rightController = null;
+            if (rightHitSource) { rightHitSource.cancel(); rightHitSource = null; }
+        }
+        if (controller === leftController) leftController = null;
+    });
+
+    function stick(controller) {
+        const mc = controller && controller.motionController;
+        const c = mc && mc.getComponent("xr-standard-thumbstick");
+        if (!c) return { x: 0, y: 0 };
+        return {
+            x: Math.abs(c.axes.x) > DEADZONE ? c.axes.x : 0,
+            y: Math.abs(c.axes.y) > DEADZONE ? c.axes.y : 0
+        };
+    }
+
+    // ---------- continuous thumbstick controls ----------
+    scene.onBeforeRenderObservable.add(() => {
+        if (!lastModel) return;
+        const dt = engine.getDeltaTime() / 1000;
+
+        // Q2c: right stick moves the model on the horizontal plane, relative to where you look
+        if (ENABLE_MOVE) {
+            const r = stick(rightController);
+            if (r.x || r.y) {
+                const cam = scene.activeCamera;
+                const fwd = cam.getDirection(BABYLON.Axis.Z); fwd.y = 0; fwd.normalize();
+                const right = cam.getDirection(BABYLON.Axis.X); right.y = 0; right.normalize();
+                // pushing the stick forward gives y = -1
+                const move = right.scale(r.x).add(fwd.scale(-r.y)).scale(MOVE_SPEED * dt);
+                lastModel.position.addInPlace(move);              // y unchanged -> stays on the plane
+            }
+        }
+
+        // Q2d: left stick (x axis) rotates the model about the vertical y-axis
+        if (ENABLE_ROTATE) {
+            const l = stick(leftController);
+            if (l.x) lastModel.rotation.y += l.x * ROT_SPEED * dt;
+        }
+    });
+
+    return scene;
+};
+
+createScene().then((scene) => {
+    engine.runRenderLoop(() => scene.render());
+}).catch((e) => {
+    console.error(e);
+    document.getElementById("info").textContent = "Error: " + e.message +
+        " (serve this folder over http://localhost, and check MODEL_FILE)";
+});
+window.addEventListener("resize", () => engine.resize());
+</script>
+</body>
+</html>
